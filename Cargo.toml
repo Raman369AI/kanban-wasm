@@ -1,0 +1,28 @@
+[package]
+name = "kanban"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+leptos = { version = "0.6", features = ["csr"] }
+leptos_meta = { version = "0.6" }
+uuid = { version = "1", features = ["v4", "js"] }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "DragEvent",
+    "DataTransfer",
+    "HtmlElement",
+    "Element",
+    "CssStyleDeclaration",
+]}
+gloo-utils = "0.2"
+gloo-timers = "0.3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"

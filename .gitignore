@@ -1,0 +1,6 @@
+/target
+/dist
+mcp_server/.venv
+mcp_server/board_state.json
+mcp_server/__pycache__/
+.DS_Store
