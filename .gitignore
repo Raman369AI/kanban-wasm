@@ -1,4 +1,5 @@
 /target
+launcher/target/
 /dist
 mcp_server/.venv
 mcp_server/board_state.json

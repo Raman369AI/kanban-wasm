@@ -1,7 +1,0 @@
-/home/kronos/Desktop/kanban-wasm/launcher/target/release/deps/cfg_if-a1237c3fef9abf24.d: /home/kronos/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.4/src/lib.rs
-
-/home/kronos/Desktop/kanban-wasm/launcher/target/release/deps/libcfg_if-a1237c3fef9abf24.rlib: /home/kronos/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.4/src/lib.rs
-
-/home/kronos/Desktop/kanban-wasm/launcher/target/release/deps/libcfg_if-a1237c3fef9abf24.rmeta: /home/kronos/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.4/src/lib.rs
-
-/home/kronos/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.4/src/lib.rs:
