@@ -12,7 +12,8 @@ STATE_FILE = Path(__file__).parent / "board_state.json"
 def _default_state() -> dict:
     def card(title: str, desc: str, tag: str, epic_id: str | None = None) -> dict:
         return {"id": str(uuid.uuid4()), "title": title, "desc": desc, "tag": tag,
-                "epic_id": epic_id, "story_id": None, "subtasks": []}
+                "epic_id": epic_id, "story_id": None, "subtasks": [],
+                "logged_secs": 0, "resources": []}
 
     return {
         "columns": [
@@ -55,7 +56,8 @@ def _default_state() -> dict:
                 "color": "#6366f1",
                 "deadline": "2026-06-30",
                 "estimated_hours": 120.0,
-                "logged_secs": 0,
+                "direct_logged_secs": 0,
+                "resources": [],
             },
             {
                 "id": "epic-2",
@@ -64,7 +66,8 @@ def _default_state() -> dict:
                 "color": "#f59e0b",
                 "deadline": "2026-04-15",
                 "estimated_hours": 40.0,
-                "logged_secs": 0,
+                "direct_logged_secs": 0,
+                "resources": [],
             },
         ],
         "stories": [],
@@ -84,6 +87,28 @@ def _load() -> dict:
             if "stories" not in state:
                 state["stories"] = []
                 _save(state)
+            # Migrate: resources fields
+            for col in state.get("columns", []):
+                for card in col.get("cards", []):
+                    if "resources" not in card:
+                        card["resources"] = []
+                    if "logged_secs" not in card:
+                        card["logged_secs"] = 0
+            for s in state.get("stories", []):
+                if "resources" not in s:
+                    s["resources"] = []
+                if "direct_logged_secs" not in s:
+                    s["direct_logged_secs"] = 0
+            for ep in state.get("epics", []):
+                if "resources" not in ep:
+                    ep["resources"] = []
+                # Migrate logged_secs -> direct_logged_secs
+                if "direct_logged_secs" not in ep:
+                    ep["direct_logged_secs"] = ep.pop("logged_secs", 0)
+                elif "logged_secs" in ep:
+                    # Both present — keep direct_logged_secs, remove legacy key
+                    ep.pop("logged_secs", None)
+            _save(state)
             return state
         except (json.JSONDecodeError, OSError):
             pass
@@ -122,6 +147,37 @@ def _find_story(state: dict, story_id: str) -> dict | None:
     return next((s for s in state["stories"] if s["id"] == story_id), None)
 
 
+# ── Aggregation helpers ───────────────────────────────────────────────────────
+
+def _story_total_secs(story_id: str) -> int:
+    direct = next((s["direct_logged_secs"] for s in _state["stories"] if s["id"] == story_id), 0)
+    task_secs = sum(
+        c.get("logged_secs", 0)
+        for col in _state["columns"]
+        for c in col["cards"]
+        if c.get("story_id") == story_id
+    )
+    return direct + task_secs
+
+
+def _epic_total_secs(epic_id: str) -> int:
+    ep = _find_epic(_state, epic_id)
+    direct = ep.get("direct_logged_secs", 0) if ep else 0
+    story_secs = sum(
+        _story_total_secs(s["id"])
+        for s in _state["stories"]
+        if s["epic_id"] == epic_id
+    )
+    # Cards on the epic but not assigned to any story
+    orphan_secs = sum(
+        c.get("logged_secs", 0)
+        for col in _state["columns"]
+        for c in col["cards"]
+        if c.get("epic_id") == epic_id and not c.get("story_id")
+    )
+    return direct + story_secs + orphan_secs
+
+
 # ── Column / Card Tools ───────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -153,6 +209,8 @@ def list_cards(column_id: str) -> list[dict]:
                 "epic_id": card.get("epic_id"),
                 "story_id": card.get("story_id"),
                 "subtask_count": len(card.get("subtasks", [])),
+                "logged_secs": card.get("logged_secs", 0),
+                "resource_count": len(card.get("resources", [])),
                 "column_id": col["id"],
                 "column_title": col["title"],
             })
@@ -183,6 +241,8 @@ def add_card(column_id: str, title: str, desc: str = "", tag: str = "Task",
         "epic_id": epic_id or None,
         "story_id": story_id or None,
         "subtasks": [],
+        "logged_secs": 0,
+        "resources": [],
     }
     col["cards"].append(new_card)
     _save(_state)
@@ -263,15 +323,17 @@ def list_epics() -> list[dict]:
     """List all epics with time tracking info."""
     result = []
     for ep in _state["epics"]:
-        secs = ep["logged_secs"]
+        direct = ep.get("direct_logged_secs", 0)
+        total  = _epic_total_secs(ep["id"])
         result.append({
             "id": ep["id"],
             "title": ep["title"],
             "color": ep["color"],
             "deadline": ep["deadline"],
             "estimated_hours": ep["estimated_hours"],
-            "logged_secs": secs,
-            "logged_hours": round(secs / 3600, 2),
+            "direct_logged_secs": direct,
+            "total_logged_secs": total,
+            "total_logged_hours": round(total / 3600, 2),
         })
     return result
 
@@ -296,7 +358,8 @@ def add_epic(title: str, desc: str = "", color: str = "#6366f1",
         "color": color,
         "deadline": deadline,
         "estimated_hours": estimated_hours,
-        "logged_secs": 0,
+        "direct_logged_secs": 0,
+        "resources": [],
     })
     _save(_state)
     return {"id": new_id}
@@ -323,24 +386,55 @@ def delete_epic(epic_id: str) -> dict:
 
 
 @mcp.tool()
-def log_time(epic_id: str, seconds: int) -> dict:
-    """Add logged time to an epic (e.g. from a Pomodoro session).
+def log_time(entity_id: str, seconds: int, entity_type: str = "epic") -> dict:
+    """Add logged time to an epic, story, or card.
 
     Args:
-        epic_id: Epic to log time against.
+        entity_id: Id of the entity to log time against.
         seconds: Number of seconds to add.
+        entity_type: "epic" | "story" | "card" (default: "epic").
     """
-    ep = _find_epic(_state, epic_id)
-    if ep is None:
-        raise ValueError(f"Epic '{epic_id}' not found.")
-    ep["logged_secs"] += max(0, seconds)
-    _save(_state)
-    total = ep["logged_secs"]
-    return {
-        "epic_id": epic_id,
-        "logged_secs": total,
-        "logged_hours": round(total / 3600, 2),
-    }
+    added = max(0, seconds)
+    if entity_type == "epic":
+        ep = _find_epic(_state, entity_id)
+        if ep is None:
+            raise ValueError(f"Epic '{entity_id}' not found.")
+        ep["direct_logged_secs"] = ep.get("direct_logged_secs", 0) + added
+        _save(_state)
+        total = _epic_total_secs(entity_id)
+        return {
+            "entity_type": "epic",
+            "entity_id": entity_id,
+            "direct_logged_secs": ep["direct_logged_secs"],
+            "total_logged_secs": total,
+            "total_logged_hours": round(total / 3600, 2),
+        }
+    elif entity_type == "story":
+        s = _find_story(_state, entity_id)
+        if s is None:
+            raise ValueError(f"Story '{entity_id}' not found.")
+        s["direct_logged_secs"] = s.get("direct_logged_secs", 0) + added
+        _save(_state)
+        total = _story_total_secs(entity_id)
+        return {
+            "entity_type": "story",
+            "entity_id": entity_id,
+            "direct_logged_secs": s["direct_logged_secs"],
+            "total_logged_secs": total,
+        }
+    elif entity_type == "card":
+        _, card = _find_card(_state, entity_id)
+        if card is None:
+            raise ValueError(f"Card '{entity_id}' not found.")
+        card["logged_secs"] = card.get("logged_secs", 0) + added
+        _save(_state)
+        return {
+            "entity_type": "card",
+            "entity_id": entity_id,
+            "logged_secs": card["logged_secs"],
+        }
+    else:
+        raise ValueError(f"Unknown entity_type '{entity_type}'. Use epic, story, or card.")
 
 
 @mcp.tool()
@@ -363,9 +457,12 @@ def get_epic_summary(epic_id: str) -> str:
     done = len(done_cards)
     pct = int(done * 100 / total) if total else 0
 
-    logged_secs = ep["logged_secs"]
-    logged_h = logged_secs // 3600
-    logged_m = (logged_secs % 3600) // 60
+    total_secs  = _epic_total_secs(epic_id)
+    direct_secs = ep.get("direct_logged_secs", 0)
+    total_h  = total_secs // 3600
+    total_m  = (total_secs % 3600) // 60
+    direct_h = direct_secs // 3600
+    direct_m = (direct_secs % 3600) // 60
 
     stories = [s for s in _state["stories"] if s["epic_id"] == epic_id]
 
@@ -379,7 +476,8 @@ def get_epic_summary(epic_id: str) -> str:
         f"`{done}/{total} tasks done` — **{pct}%**",
         "",
         f"## Time",
-        f"- Logged: **{logged_h}h {logged_m}m**",
+        f"- Total logged: **{total_h}h {total_m}m**",
+        f"- Direct logged: **{direct_h}h {direct_m}m**",
         f"- Estimated: **{ep['estimated_hours']}h**",
         "",
     ]
@@ -388,12 +486,14 @@ def get_epic_summary(epic_id: str) -> str:
         lines += ["## Stories", ""]
         for s in stories:
             story_cards = [c for c in epic_cards if c.get("story_id") == s["id"]]
-            lines.append(f"- **{s['title']}** ({len(story_cards)} tasks)")
+            story_total  = _story_total_secs(s["id"])
+            story_h = story_total // 3600
+            story_m = (story_total % 3600) // 60
+            lines.append(f"- **{s['title']}** ({len(story_cards)} tasks, {story_h}h {story_m}m logged)")
         lines.append("")
 
     if epic_cards:
-        lines += ["## Tasks", "| Title | Tag | Column |", "|-------|-----|--------|"]
-        col_map = {c["id"]: c["title"] for col in _state["columns"] for c in [] or [col]}
+        lines += ["## Tasks", "| Title | Tag | Column | Logged |", "|-------|-----|--------|--------|"]
         col_map = {col["id"]: col["title"] for col in _state["columns"]}
         for c in all_cards:
             if c.get("epic_id") == epic_id:
@@ -401,7 +501,10 @@ def get_epic_summary(epic_id: str) -> str:
                     (col["title"] for col in _state["columns"] if any(x["id"] == c["id"] for x in col["cards"])),
                     "?"
                 )
-                lines.append(f"| {c['title']} | {c['tag']} | {col_name} |")
+                c_secs = c.get("logged_secs", 0)
+                c_h = c_secs // 3600
+                c_m = (c_secs % 3600) // 60
+                lines.append(f"| {c['title']} | {c['tag']} | {col_name} | {c_h}h {c_m}m |")
 
     return "\n".join(l for l in lines)
 
@@ -418,7 +521,16 @@ def list_stories(epic_id: str = "all") -> list[dict]:
     stories = _state["stories"]
     if epic_id != "all":
         stories = [s for s in stories if s["epic_id"] == epic_id]
-    return [{"id": s["id"], "epic_id": s["epic_id"], "title": s["title"]} for s in stories]
+    return [
+        {
+            "id": s["id"],
+            "epic_id": s["epic_id"],
+            "title": s["title"],
+            "direct_logged_secs": s.get("direct_logged_secs", 0),
+            "total_logged_secs": _story_total_secs(s["id"]),
+        }
+        for s in stories
+    ]
 
 
 @mcp.tool()
@@ -433,7 +545,13 @@ def add_story(epic_id: str, title: str) -> dict:
     if ep is None:
         raise ValueError(f"Epic '{epic_id}' not found.")
     new_id = str(uuid.uuid4())
-    _state["stories"].append({"id": new_id, "epic_id": epic_id, "title": title})
+    _state["stories"].append({
+        "id": new_id,
+        "epic_id": epic_id,
+        "title": title,
+        "direct_logged_secs": 0,
+        "resources": [],
+    })
     _save(_state)
     return {"id": new_id}
 
@@ -451,6 +569,101 @@ def delete_story(story_id: str) -> dict:
     _state["stories"].remove(story)
     _save(_state)
     return {"deleted_story_id": story_id}
+
+
+# ── Resource Tools ────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def add_resource(entity_type: str, entity_id: str, title: str, url: str = "", kind: str = "Link", notes: str = "") -> dict:
+    """Add a resource (link/note/doc) to any entity on the board.
+
+    Args:
+        entity_type: "epic", "story", or "card"
+        entity_id: id of the entity
+        title: resource title
+        url: URL or reference string
+        kind: Link | Note | Doc
+        notes: optional notes
+    """
+    new_res = {"id": str(uuid.uuid4()), "title": title, "url": url, "kind": kind, "notes": notes}
+    if entity_type == "epic":
+        ep = _find_epic(_state, entity_id)
+        if ep is None:
+            raise ValueError(f"Epic '{entity_id}' not found.")
+        ep.setdefault("resources", []).append(new_res)
+    elif entity_type == "story":
+        s = _find_story(_state, entity_id)
+        if s is None:
+            raise ValueError(f"Story '{entity_id}' not found.")
+        s.setdefault("resources", []).append(new_res)
+    elif entity_type == "card":
+        _, card = _find_card(_state, entity_id)
+        if card is None:
+            raise ValueError(f"Card '{entity_id}' not found.")
+        card.setdefault("resources", []).append(new_res)
+    else:
+        raise ValueError(f"Unknown entity_type '{entity_type}'. Use epic, story, or card.")
+    _save(_state)
+    return {"id": new_res["id"]}
+
+
+@mcp.tool()
+def list_resources(entity_type: str = "all", entity_id: str = "") -> list[dict]:
+    """List resources attached to entities.
+
+    Args:
+        entity_type: "epic", "story", "card", or "all"
+        entity_id: specific entity id, or "" for all entities of that type
+    """
+    results = []
+
+    def collect(etype, entity):
+        for r in entity.get("resources", []):
+            results.append({**r, "entity_type": etype, "entity_id": entity["id"], "entity_title": entity.get("title", "")})
+
+    if entity_type in ("epic", "all"):
+        for ep in _state["epics"]:
+            if not entity_id or ep["id"] == entity_id:
+                collect("epic", ep)
+    if entity_type in ("story", "all"):
+        for s in _state["stories"]:
+            if not entity_id or s["id"] == entity_id:
+                collect("story", s)
+    if entity_type in ("card", "all"):
+        for col in _state["columns"]:
+            for card in col["cards"]:
+                if not entity_id or card["id"] == entity_id:
+                    collect("card", card)
+    return results
+
+
+@mcp.tool()
+def delete_resource(resource_id: str) -> dict:
+    """Delete a resource by id from whichever entity it belongs to.
+
+    Args:
+        resource_id: id of the resource to delete
+    """
+    for ep in _state["epics"]:
+        for r in ep.get("resources", []):
+            if r["id"] == resource_id:
+                ep["resources"].remove(r)
+                _save(_state)
+                return {"deleted_resource_id": resource_id}
+    for s in _state["stories"]:
+        for r in s.get("resources", []):
+            if r["id"] == resource_id:
+                s["resources"].remove(r)
+                _save(_state)
+                return {"deleted_resource_id": resource_id}
+    for col in _state["columns"]:
+        for card in col["cards"]:
+            for r in card.get("resources", []):
+                if r["id"] == resource_id:
+                    card["resources"].remove(r)
+                    _save(_state)
+                    return {"deleted_resource_id": resource_id}
+    raise ValueError(f"Resource '{resource_id}' not found.")
 
 
 # ── Board summary ─────────────────────────────────────────────────────────────

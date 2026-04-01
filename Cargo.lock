@@ -628,6 +628,8 @@ dependencies = [
  "gloo-utils",
  "leptos",
  "leptos_meta",
+ "serde",
+ "serde_json",
  "uuid",
  "wasm-bindgen",
  "web-sys",
